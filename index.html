@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mask i magen</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        #score-board {
+            padding: 20px;
+            font-size: 24px;
+            color: #fff;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+            font-weight: bold;
+        }
+        #message-overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            color: #fff;
+            text-shadow: 3px 3px 6px rgba(0,0,0,0.8);
+            display: none;
+        }
+        #message-overlay h1 {
+            font-size: 64px;
+            margin: 0;
+            text-transform: uppercase;
+        }
+        #message-overlay p {
+            font-size: 24px;
+            margin-top: 10px;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 20px;
+            width: 100%;
+            text-align: center;
+            color: rgba(255,255,255,0.5);
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="gameCanvas"></canvas>
+    
+    <div id="ui-layer">
+        <div id="score-board">Poäng: <span id="score">0</span> / 1000</div>
+        <div id="message-overlay">
+            <h1 id="end-title">Game Over</h1>
+            <p>Tryck på Mellanslag för att starta om</p>
+        </div>
+        <div id="instructions">Styr med musen. Mål: 1000 poäng.</div>
+    </div>
+
+<script>
+/**
+ * SENIOR GAME DEV NOTES:
+ * - Architecture: Entity-Component-like logic using standard ES6 classes.
+ * - Physics: Custom smooth trailing algorithm for segments. Distance squared used for optimization.
+ * - Rendering: Camera translation, off-screen culling (implicit by canvas clipping).
+ * - AI: State-based steering (seek food, avoid danger vectors).
+ */
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('score');
+const messageOverlay = document.getElementById('message-overlay');
+const endTitle = document.getElementById('end-title');
+
+// Game Constants
+const WORLD_SIZE = 4000;
+const START_SEGMENTS = 10;
+const SEGMENT_SPACING = 12;
+const MAX_SCORE = 1000;
+const FOOD_COUNT = 500;
+const BOT_COUNT = 15;
+const WORM_RADIUS = 10;
+const FOOD_RADIUS = 5;
+
+// Variables
+let width, height;
+let mouseX = 0, mouseY = 0;
+let worms = [];
+let foods = [];
+let player = null;
+let gameState = 'playing'; // playing, gameover, win
+let cameraX = 0, cameraY = 0;
+
+// Colors
+const colors = ['#e74c3c', '#2ecc71', '#3498db', '#f1c40f', '#9b59b6', '#e67e22', '#1abc9c'];
+
+// --- Utility Functions ---
+function resize() {
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = width;
+    canvas.height = height;
+}
+
+function randomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function distSq(x1, y1, x2, y2) {
+    return (x2 - x1) ** 2 + (y2 - y1) ** 2;
+}
+
+// Smoothly interpolate angles avoiding the PI/-PI wrap issue
+function lerpAngle(a, b, t) {
+    let d = b - a;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return a + d * t;
+}
+
+// --- Classes ---
+class Food {
+    constructor(x, y, color) {
+        this.x = x || randomInt(0, WORLD_SIZE);
+        this.y = y || randomInt(0, WORLD_SIZE);
+        this.color = color || colors[randomInt(0, colors.length - 1)];
+        this.value = 10;
+    }
+
+    draw(ctx) {
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, FOOD_RADIUS, 0, Math.PI * 2);
+        ctx.fillStyle = this.color;
+        ctx.fill();
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = this.color;
+        ctx.closePath();
+        ctx.shadowBlur = 0; // Reset
+    }
+}
+
+class Worm {
+    constructor(x, y, isPlayer = false) {
+        this.isPlayer = isPlayer;
+        this.color = colors[randomInt(0, colors.length - 1)];
+        this.segments = [];
+        this.score = 0;
+        this.speed = this.isPlayer ? 4 : randomInt(3, 4);
+        this.angle = Math.random() * Math.PI * 2;
+        this.targetAngle = this.angle;
+        this.turnSpeed = this.isPlayer ? 0.12 : 0.08;
+        this.dead = false;
+        
+        // Initialize body
+        for (let i = 0; i < START_SEGMENTS; i++) {
+            this.segments.push({ x: x - i * SEGMENT_SPACING, y: y });
+        }
+    }
+
+    get head() { return this.segments[0]; }
+
+    update() {
+        if (this.dead) return;
+
+        // Smooth rotation
+        this.angle = lerpAngle(this.angle, this.targetAngle, this.turnSpeed);
+
+        // Move head
+        let headX = this.head.x + Math.cos(this.angle) * this.speed;
+        let headY = this.head.y + Math.sin(this.angle) * this.speed;
+
+        // Wall collisions (soft bounce for AI, instant death for player out of bounds is too harsh, 
+        // let's do soft bounds for everyone like a spherical map or strong repulse)
+        if (headX < 0 || headX > WORLD_SIZE || headY < 0 || headY > WORLD_SIZE) {
+            if(this.isPlayer) {
+                die(this);
+                return;
+            } else {
+                this.targetAngle += Math.PI; // Turn around
+                headX = Math.max(0, Math.min(WORLD_SIZE, headX));
+                headY = Math.max(0, Math.min(WORLD_SIZE, headY));
+            }
+        }
+
+        // Save old head position to cascade down the body
+        let prevX = this.head.x;
+        let prevY = this.head.y;
+
+        this.head.x = headX;
+        this.head.y = headY;
+
+        // Move body segments using spring/distance logic
+        for (let i = 1; i < this.segments.length; i++) {
+            let seg = this.segments[i];
+            let dx = prevX - seg.x;
+            let dy = prevY - seg.y;
+            let dist = Math.sqrt(dx * dx + dy * dy);
+
+            // Save current position for next segment
+            let tempX = seg.x;
+            let tempY = seg.y;
+
+            if (dist > SEGMENT_SPACING) {
+                seg.x += (dx / dist) * (dist - SEGMENT_SPACING);
+                seg.y += (dy / dist) * (dist - SEGMENT_SPACING);
+            }
+
+            prevX = tempX;
+            prevY = tempY;
+        }
+
+        this.checkCollisions();
+    }
+
+    checkCollisions() {
+        // 1. Eat Food
+        for (let i = foods.length - 1; i >= 0; i--) {
+            if (distSq(this.head.x, this.head.y, foods[i].x, foods[i].y) < (WORM_RADIUS + FOOD_RADIUS) ** 2) {
+                this.score += foods[i].value;
+                foods.splice(i, 1);
+                this.grow();
+                spawnFood(1); // Respawn eaten food
+
+                if (this.isPlayer) {
+                    scoreEl.innerText = this.score;
+                    if (this.score >= MAX_SCORE && gameState === 'playing') {
+                        triggerWin();
+                    }
+                }
+            }
+        }
+
+        // 2. Head vs other Worms body
+        for (let w of worms) {
+            if (w === this || w.dead) continue;
+            // Start from segment 2 to avoid head-to-head clipping weirdness
+            for (let i = 2; i < w.segments.length; i++) {
+                let seg = w.segments[i];
+                if (distSq(this.head.x, this.head.y, seg.x, seg.y) < (WORM_RADIUS * 2) ** 2) {
+                    die(this);
+                    return;
+                }
+            }
+        }
+    }
+
+    grow() {
+        // Add a segment to the tail based on score milestones
+        let targetLength = START_SEGMENTS + Math.floor(this.score / 20);
+        while (this.segments.length < targetLength) {
+            let tail = this.segments[this.segments.length - 1];
+            this.segments.push({ x: tail.x, y: tail.y });
+        }
+    }
+
+    updateAI() {
+        if (this.dead) return;
+
+        let head = this.head;
+        let danger = false;
+        let dangerAngle = 0;
+
+        // 1. Avoid Danger (Other worms)
+        for (let w of worms) {
+            if (w === this || w.dead) continue;
+            for (let i = 0; i < w.segments.length; i+=3) { // Skip every few segments for performance
+                let seg = w.segments[i];
+                let dSq = distSq(head.x, head.y, seg.x, seg.y);
+                if (dSq < 20000) { // Danger radius (~140px)
+                    danger = true;
+                    // Steer away from danger
+                    dangerAngle = Math.atan2(head.y - seg.y, head.x - seg.x);
+                    break;
+                }
+            }
+            if(danger) break;
+        }
+
+        if (danger) {
+            this.targetAngle = dangerAngle;
+            return;
+        }
+
+        // 2. Seek Food
+        let closestFood = null;
+        let minDistSq = Infinity;
+        
+        // Optimize: Check a subset of food or limit vision range
+        for (let i = 0; i < foods.length; i += 2) { 
+            let f = foods[i];
+            let dSq = distSq(head.x, head.y, f.x, f.y);
+            if (dSq < minDistSq && dSq < 90000) { // Vision radius (~300px)
+                minDistSq = dSq;
+                closestFood = f;
+            }
+        }
+
+        if (closestFood) {
+            this.targetAngle = Math.atan2(closestFood.y - head.y, closestFood.x - head.x);
+        } else {
+            // Wander randomly if no food
+            if (Math.random() < 0.02) {
+                this.targetAngle += (Math.random() - 0.5);
+            }
+        }
+    }
+
+    draw(ctx) {
+        if (this.dead) return;
+
+        // Draw segments from tail to head
+        for (let i = this.segments.length - 1; i >= 0; i--) {
+            let seg = this.segments[i];
+            ctx.beginPath();
+            ctx.arc(seg.x, seg.y, WORM_RADIUS, 0, Math.PI * 2);
+            
+            // Alternate colors slightly for a striped effect
+            if (i % 2 === 0) {
+                ctx.fillStyle = this.color;
+            } else {
+                ctx.fillStyle = '#ffffff'; // White stripes
+                ctx.globalAlpha = 0.3;
+            }
+            
+            ctx.fill();
+            
+            // Border
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+            ctx.stroke();
+            ctx.globalAlpha = 1.0; // Reset
+            ctx.closePath();
+        }
+
+        // Draw Eyes on Head
+        let eyeOffset = WORM_RADIUS * 0.5;
+        let headX = this.head.x;
+        let headY = this.head.y;
+        
+        ctx.fillStyle = 'white';
+        // Left eye
+        ctx.beginPath();
+        ctx.arc(headX + Math.cos(this.angle - 0.5) * eyeOffset, headY + Math.sin(this.angle - 0.5) * eyeOffset, 4, 0, Math.PI*2);
+        ctx.fill();
+        // Right eye
+        ctx.beginPath();
+        ctx.arc(headX + Math.cos(this.angle + 0.5) * eyeOffset, headY + Math.sin(this.angle + 0.5) * eyeOffset, 4, 0, Math.PI*2);
+        ctx.fill();
+
+        ctx.fillStyle = 'black';
+        // Pupils
+        ctx.beginPath();
+        ctx.arc(headX + Math.cos(this.angle - 0.5) * eyeOffset + Math.cos(this.angle)*1.5, headY + Math.sin(this.angle - 0.5) * eyeOffset + Math.sin(this.angle)*1.5, 2, 0, Math.PI*2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(headX + Math.cos(this.angle + 0.5) * eyeOffset + Math.cos(this.angle)*1.5, headY + Math.sin(this.angle + 0.5) * eyeOffset + Math.sin(this.angle)*1.5, 2, 0, Math.PI*2);
+        ctx.fill();
+    }
+}
+
+// --- Game Logic ---
+function init() {
+    resize();
+    window.addEventListener('resize', resize);
+    
+    document.addEventListener('mousemove', (e) => {
+        mouseX = e.clientX;
+        mouseY = e.clientY;
+    });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.code === 'Space' && gameState !== 'playing') {
+            resetGame();
+        }
+    });
+
+    resetGame();
+    requestAnimationFrame(gameLoop);
+}
+
+function resetGame() {
+    worms = [];
+    foods = [];
+    gameState = 'playing';
+    messageOverlay.style.display = 'none';
+    scoreEl.innerText = '0';
+
+    // Spawn player
+    player = new Worm(WORLD_SIZE / 2, WORLD_SIZE / 2, true);
+    worms.push(player);
+
+    // Spawn Bots
+    for (let i = 0; i < BOT_COUNT; i++) {
+        spawnBot();
+    }
+
+    // Spawn Food
+    spawnFood(FOOD_COUNT);
+}
+
+function spawnBot() {
+    let x = randomInt(100, WORLD_SIZE - 100);
+    let y = randomInt(100, WORLD_SIZE - 100);
+    worms.push(new Worm(x, y, false));
+}
+
+function spawnFood(amount) {
+    for (let i = 0; i < amount; i++) {
+        foods.push(new Food());
+    }
+}
+
+function die(worm) {
+    worm.dead = true;
+    
+    // Convert body to high-value food
+    for (let i = 0; i < worm.segments.length; i += 2) {
+        let f = new Food(worm.segments[i].x, worm.segments[i].y, worm.color);
+        f.value = 20; // Dead worms give more points
+        foods.push(f);
+    }
+
+    if (worm.isPlayer) {
+        gameState = 'gameover';
+        endTitle.innerText = "Spelet Slut!";
+        endTitle.style.color = "#e74c3c";
+        messageOverlay.style.display = 'block';
+    } else {
+        // Respawn bot to keep arena populated
+        setTimeout(spawnBot, 2000);
+    }
+}
+
+function triggerWin() {
+    gameState = 'win';
+    endTitle.innerText = "Du Vann!";
+    endTitle.style.color = "#2ecc71";
+    messageOverlay.style.display = 'block';
+}
+
+function drawBackground() {
+    // A subtle grid to give sense of movement
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+    ctx.lineWidth = 2;
+    const gridSize = 100;
+    
+    let startX = Math.floor(cameraX / gridSize) * gridSize;
+    let startY = Math.floor(cameraY / gridSize) * gridSize;
+
+    ctx.beginPath();
+    for (let x = startX; x < startX + width + gridSize; x += gridSize) {
+        ctx.moveTo(x, cameraY);
+        ctx.lineTo(x, cameraY + height);
+    }
+    for (let y = startY; y < startY + height + gridSize; y += gridSize) {
+        ctx.moveTo(cameraX, y);
+        ctx.lineTo(cameraX + width, y);
+    }
+    ctx.stroke();
+
+    // Draw world boundaries
+    ctx.strokeStyle = '#e74c3c';
+    ctx.lineWidth = 5;
+    ctx.strokeRect(0, 0, WORLD_SIZE, WORLD_SIZE);
+}
+
+function gameLoop() {
+    // Clear Screen
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, width, height);
+
+    if (gameState === 'playing' && player && !player.dead) {
+        // Calculate player target angle based on mouse
+        // Mouse coordinates need to be mapped to world space relative to center screen
+        let dx = mouseX - width / 2;
+        let dy = mouseY - height / 2;
+        player.targetAngle = Math.atan2(dy, dx);
+    }
+
+    // Update entities
+    worms.forEach(w => {
+        if (!w.isPlayer) w.updateAI();
+        w.update();
+    });
+
+    // Remove dead worms from array
+    worms = worms.filter(w => !w.dead);
+
+    // Update Camera
+    if (player && !player.dead) {
+        // Lerp camera to player position for smoothness
+        cameraX += (player.head.x - width / 2 - cameraX) * 0.1;
+        cameraY += (player.head.y - height / 2 - cameraY) * 0.1;
+    }
+
+    // Apply Camera Transform
+    ctx.save();
+    ctx.translate(-cameraX, -cameraY);
+
+    drawBackground();
+
+    // Render Food (Only draw if inside camera view for performance)
+    foods.forEach(f => {
+        if (f.x > cameraX - 20 && f.x < cameraX + width + 20 &&
+            f.y > cameraY - 20 && f.y < cameraY + height + 20) {
+            f.draw(ctx);
+        }
+    });
+
+    // Render Worms
+    // Draw AI first, then player on top
+    worms.forEach(w => { if (!w.isPlayer) w.draw(ctx); });
+    if (player && !player.dead) player.draw(ctx);
+
+    ctx.restore(); // Reset transform
+
+    requestAnimationFrame(gameLoop);
+}
+
+// Start
+init();
+
+</script>
+</body>
+</html>
